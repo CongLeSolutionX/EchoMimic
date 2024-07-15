@@ -4,28 +4,28 @@
 webui
 '''
 
+import argparse
 import os
 import random
 from datetime import datetime
 from pathlib import Path
 
 import cv2
+import gradio as gr
 import numpy as np
 import torch
 from diffusers import AutoencoderKL, DDIMScheduler
+from facenet_pytorch import MTCNN
+from moviepy.editor import AudioFileClip, VideoFileClip
 from omegaconf import OmegaConf
 from PIL import Image
+
+from src.models.face_locator import FaceLocator
 from src.models.unet_2d_condition import UNet2DConditionModel
 from src.models.unet_3d_echo import EchoUNet3DConditionModel
 from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echo_mimic import Audio2VideoPipeline
-from src.utils.util import save_videos_grid, crop_and_pad
-from src.models.face_locator import FaceLocator
-from moviepy.editor import VideoFileClip, AudioFileClip
-from facenet_pytorch import MTCNN
-import argparse
-
-import gradio as gr
+from src.utils.util import crop_and_pad, save_videos_grid
 
 default_values = {
     "width": 512,
@@ -40,16 +40,15 @@ default_values = {
     "steps": 30,
     "sample_rate": 16000,
     "fps": 24,
-    "device": "cuda"
+    "device": "cpu"  # Default to CPU
 }
 
 ffmpeg_path = os.getenv('FFMPEG_PATH')
 if ffmpeg_path is None:
-    print("please download ffmpeg-static and export to FFMPEG_PATH. \nFor example: export FFMPEG_PATH=/musetalk/ffmpeg-4.4-amd64-static")
+    print("Please download ffmpeg-static and export to FFMPEG_PATH. \nFor example: export FFMPEG_PATH=/musetalk/ffmpeg-4.4-amd64-static")
 elif ffmpeg_path not in os.getenv('PATH'):
-    print("add ffmpeg to path")
+    print("Add ffmpeg to path")
     os.environ["PATH"] = f"{ffmpeg_path}:{os.environ['PATH']}"
-
 
 config_path = "./configs/prompts/animation.yaml"
 config = OmegaConf.load(config_path)
@@ -58,23 +57,29 @@ if config.weight_dtype == "fp16":
 else:
     weight_dtype = torch.float32
 
-device = "cuda"
-if not torch.cuda.is_available():
+# Determine the device to use (MPS > CUDA > CPU)
+if torch.backends.mps.is_available():
+    device = "mps"
+elif torch.cuda.is_available():
+    device = "cuda"
+else:
     device = "cpu"
+
+print(f"Using device: {device}")  # Print the selected device
 
 inference_config_path = config.inference_config
 infer_config = OmegaConf.load(inference_config_path)
 
 ############# model_init started #############
 ## vae init
-vae = AutoencoderKL.from_pretrained(config.pretrained_vae_path).to("cuda", dtype=weight_dtype)
+vae = AutoencoderKL.from_pretrained(config.pretrained_vae_path).to(device, dtype=weight_dtype)
 
 ## reference net init
 reference_unet = UNet2DConditionModel.from_pretrained(
     config.pretrained_base_model_path,
     subfolder="unet",
 ).to(dtype=weight_dtype, device=device)
-reference_unet.load_state_dict(torch.load(config.reference_unet_path, map_location="cpu"))
+reference_unet.load_state_dict(torch.load(config.reference_unet_path, map_location=device))
 
 ## denoising net init
 if os.path.exists(config.motion_module_path):
@@ -98,11 +103,11 @@ else:
         }
     ).to(dtype=weight_dtype, device=device)
 
-denoising_unet.load_state_dict(torch.load(config.denoising_unet_path, map_location="cpu"), strict=False)
+denoising_unet.load_state_dict(torch.load(config.denoising_unet_path, map_location=device), strict=False)
 
 ## face locator init
-face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(dtype=weight_dtype, device="cuda")
-face_locator.load_state_dict(torch.load(config.face_locator_path))
+face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(dtype=weight_dtype, device=device)
+face_locator.load_state_dict(torch.load(config.face_locator_path, map_location=device))
 
 ## load audio processor params
 audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
@@ -122,7 +127,7 @@ pipe = Audio2VideoPipeline(
     audio_guider=audio_processor,
     face_locator=face_locator,
     scheduler=scheduler,
-).to("cuda", dtype=weight_dtype)
+).to(device, dtype=weight_dtype)
 
 def select_face(det_bboxes, probs):
     ## max face from faces that the prob is above 0.8
@@ -170,7 +175,7 @@ def process_video(uploaded_img, uploaded_audio, width, height, length, seed, fac
         face_mask = cv2.resize(face_mask, (width, height))
 
     ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
-    face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device="cuda").unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+    face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
     
     video = pipe(
         ref_image_pil,

@@ -1,0 +1,17 @@
+torch
+torchvision
+torchaudio
+mediapipe
+transformers
+diffusers
+torchmetrics
+torchtyping
+tqdm
+ffmpeg-python
+facenet_pytorch
+moviepy
+einops
+omegaconf
+opencv-python
+av
+gradio

@@ -4,13 +4,12 @@
 @Project ：EchoMimic
 @File    ：audio2vid.py
 @Author  ：juzhen.czy
-@Date    ：2024/3/4 17:43 
+@Date    ：2024/3/4 17:43
 '''
 import argparse
 import os
-
-import random
 import platform
+import random
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -19,18 +18,29 @@ import cv2
 import numpy as np
 import torch
 from diffusers import AutoencoderKL, DDIMScheduler
+from facenet_pytorch import MTCNN
+from moviepy.editor import AudioFileClip, VideoFileClip
 from omegaconf import OmegaConf
 from PIL import Image
 
+from src.models.face_locator import FaceLocator
 from src.models.unet_2d_condition import UNet2DConditionModel
 from src.models.unet_3d_echo import EchoUNet3DConditionModel
 from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echo_mimic import Audio2VideoPipeline
-from src.utils.util import save_videos_grid, crop_and_pad
-from src.models.face_locator import FaceLocator
-from moviepy.editor import VideoFileClip, AudioFileClip
-from facenet_pytorch import MTCNN
+from src.utils.util import crop_and_pad, save_videos_grid
 
+
+# Function to get the appropriate device
+def get_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
+    else:
+        return "cpu"
+
+# Get FFMPEG path
 ffmpeg_path = os.getenv('FFMPEG_PATH')
 if ffmpeg_path is None and platform.system() in ['Linux', 'Darwin']:
     try:
@@ -65,7 +75,9 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--fps", type=int, default=24)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default=get_device(), 
+                        choices=["cuda", "cpu", "mps"], 
+                        help="Device to use for inference (defaults to MPS > CUDA > CPU)")
 
     args = parser.parse_args()
 
@@ -98,8 +110,7 @@ def main():
         weight_dtype = torch.float32
 
     device = args.device
-    if device.__contains__("cuda") and not torch.cuda.is_available():
-        device = "cpu"
+    print(f"Using device: {device}")
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
@@ -110,7 +121,7 @@ def main():
     ## vae init
     vae = AutoencoderKL.from_pretrained(
         config.pretrained_vae_path,
-    ).to("cuda", dtype=weight_dtype)
+    ).to(device, dtype=weight_dtype)
 
     ## reference net init
     reference_unet = UNet2DConditionModel.from_pretrained(
@@ -118,7 +129,7 @@ def main():
         subfolder="unet",
     ).to(dtype=weight_dtype, device=device)
     reference_unet.load_state_dict(
-        torch.load(config.reference_unet_path, map_location="cpu"),
+        torch.load(config.reference_unet_path, map_location=device),
     )
 
     ## denoising net init
@@ -143,15 +154,15 @@ def main():
             }
         ).to(dtype=weight_dtype, device=device)
     denoising_unet.load_state_dict(
-        torch.load(config.denoising_unet_path, map_location="cpu"),
+        torch.load(config.denoising_unet_path, map_location=device),
         strict=False
     )
 
     ## face locator init
     face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(
-        dtype=weight_dtype, device="cuda"
+        dtype=weight_dtype, device=device
     )
-    face_locator.load_state_dict(torch.load(config.face_locator_path))
+    face_locator.load_state_dict(torch.load(config.face_locator_path, map_location=device))
 
     ### load audio processor params
     audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
@@ -173,7 +184,7 @@ def main():
         face_locator=face_locator,
         scheduler=scheduler,
     )
-    pipe = pipe.to("cuda", dtype=weight_dtype)
+    pipe = pipe.to(device, dtype=weight_dtype)
 
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M")
@@ -220,7 +231,7 @@ def main():
                 face_mask = cv2.resize(face_mask, (args.W, args.H))
 
             ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
-            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device="cuda").unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
 
             video = pipe(
                 ref_image_pil,
